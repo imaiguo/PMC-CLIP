@@ -20,6 +20,22 @@ TextEncoderPath = "/opt/Data/ModelWeight/axiong/pmc_oa/text_encoder.pth"
 TextProjectionLayerPath = "/opt/Data/ModelWeight/axiong/pmc_oa/text_projection_layer.pth"
 ImageEncoderPath = "/opt/Data/ModelWeight/axiong/pmc_oa/image_encoder(resnet50).pth"
 
+# Logit Scale
+LogitScale = 4.4292
+
+# Device
+Device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+image_path_ls = [
+    'image/chest_X-ray.jpg',
+    'image/brain_MRI.jpg'
+]
+
+bert_input = [
+    'chest X-ray',
+    'brain MRI',
+]
+
 def freeze_batch_norm_2d(module, module_match={}, name=''):
     """
     Converts all `BatchNorm2d` and `SyncBatchNorm` layers of provided module into `FrozenBatchNorm2d`. If `module` is
@@ -236,7 +252,6 @@ class ModifiedResNet(nn.Module):
         return visual_output
 
 # Image preprocess
-
 def _convert_to_rgb(image):
     return image.convert('RGB')
 
@@ -265,84 +280,82 @@ def image_transform(
     ])
     return Compose(transforms)
 
-# Load Image Encoder
-image_encoder = ModifiedResNet(layers=[3,4,6,3], output_dim=768, heads=8, image_size=224, width=64)
-image_encoder.load_state_dict(torch.load(ImageEncoderPath))
+def LoadModel():
+    # Load Image Encoder
+    image_encoder = ModifiedResNet(layers=[3,4,6,3], output_dim=768, heads=8, image_size=224, width=64)
+    image_encoder.load_state_dict(torch.load(ImageEncoderPath))
 
-# Load Text Encoder
-tokenizer = AutoTokenizer.from_pretrained(BiomedNLPPath)
-text_encoder = AutoModel.from_pretrained(BiomedNLPPath)
-text_encoder.load_state_dict(torch.load(TextEncoderPath))
+    # Load Text Encoder
+    tokenizer = AutoTokenizer.from_pretrained(BiomedNLPPath)
+    text_encoder = AutoModel.from_pretrained(BiomedNLPPath)
+    text_encoder.load_state_dict(torch.load(TextEncoderPath))
 
-# Load Text Proj Layer
-text_projection_layer = torch.load(TextProjectionLayerPath)
-text_projection_layer = nn.Parameter(text_projection_layer)
+    # Load Text Proj Layer
+    text_projection_layer = torch.load(TextProjectionLayerPath)
+    text_projection_layer = nn.Parameter(text_projection_layer)
 
-# Logit Scale
-logit_scale = 4.4292
+    image_encoder = image_encoder.to(Device)
+    text_encoder = text_encoder.to(Device)
+    text_projection_layer = text_projection_layer.to(Device)
 
-# Device
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-image_encoder = image_encoder.to(device)
-text_encoder = text_encoder.to(device)
-text_projection_layer = text_projection_layer.to(device)
+    return tokenizer, image_encoder, text_encoder, text_projection_layer
 
-# Load Image
+def GetImageFeature(imageEncoder):
+    # Load Image
+    preprocess_val = image_transform(
+        image_size=224,
+    )
 
-preprocess_val = image_transform(
-    image_size=224,
-)
+    images = []
+    image_tensor = []
+    for image_path in image_path_ls:
+        image = Image.open(image_path).convert('RGB')
+        images.append(image)
+        image_tensor.append(preprocess_val(image))
 
-image_path_ls = [
-    'image/chest_X-ray.jpg',
-    'image/brain_MRI.jpg'
-]
+    image_tensor = torch.stack(image_tensor, dim=0).to(Device)
 
-images = []
-image_tensor = []
-for image_path in image_path_ls:
-    image = Image.open(image_path).convert('RGB')
-    images.append(image)
-    image_tensor.append(preprocess_val(image))
+    # Extract Image feature
+    image_feature = imageEncoder(image_tensor)
+    if isinstance(image_feature, dict):
+        image_feature = image_feature['image_features']
 
-image_tensor = torch.stack(image_tensor, dim=0).to(device)
+    loguru.logger.debug(f"image size:[{image_tensor.shape}]; feature size:[{image_feature.shape}]")
+    return images, image_feature
 
-# Extract Image feature
-image_feature = image_encoder(image_tensor)
-if isinstance(image_feature, dict):
-    image_feature = image_feature['image_features']
+def GetTextFeature(tokenizer, textEncoder, textProjectionLayer):
+    # Load Text
+    encoded_input = tokenizer(bert_input, padding='max_length', truncation=True, max_length=77, return_tensors='pt')
+    input_ids = encoded_input['input_ids'].to(Device)
 
-print(f'\033[32mimage size\033[0m: {image_tensor.shape}; feature size: {image_feature.shape}')
+    # Extract Text feature
+    text_feature = textEncoder(input_ids)
+    last_hidden_state = text_feature.last_hidden_state
+    pooler_output = text_feature.pooler_output
+    loguru.logger.debug(f"pooler_output.shape:[{pooler_output.shape}]")
+    # a @= b相当于 a = dot(a, b)
+    text_feature = pooler_output @ textProjectionLayer
+    loguru.logger.debug(f"text_feature.shape:[{text_feature.shape}]")
+    return text_feature
 
+def ImageTextSimilarity(textFeature, imageFeature, images):
+    # Calculate Similarity
+    imageFeature = imageFeature / imageFeature.norm(dim=-1, keepdim=True)
+    textFeature = textFeature / textFeature.norm(dim=-1, keepdim=True)
+    similarity = (math.exp(LogitScale) * imageFeature @ textFeature.T).softmax(dim=-1)
 
-# Load Text
-bert_input = [
-    'chest X-ray',
-    'brain MRI',
-]
+    for i, (image_path, image) in enumerate(zip(image_path_ls, images)):
+        loguru.logger.debug(image_path)
+        for j in range(len(bert_input)):
+            loguru.logger.debug(f'{bert_input[j]}: {similarity[i, j].item()}')
+        loguru.logger.debug('')
 
-encoded_input = tokenizer(bert_input, padding='max_length', truncation=True, max_length=77, return_tensors='pt')
-input_ids = encoded_input['input_ids'].to(device)
+def RunMain():
+    tokenizer, imageEncoder, textEncoder, textProjectionLayer = LoadModel()
+    images, imageFeature = GetImageFeature(imageEncoder)
+    textFeature = GetTextFeature(tokenizer, textEncoder, textProjectionLayer)
+    ImageTextSimilarity(textFeature, imageFeature, images)
 
-
-# Extract Text feature
-text_feature = text_encoder(input_ids)
-last_hidden_state = text_feature.last_hidden_state
-pooler_output = text_feature.pooler_output
-print("\033[32mpooler_output.shape\033[0m", pooler_output.shape)
-# a @= b相当于 a = dot(a, b)
-text_feature = pooler_output @ text_projection_layer
-print("\033[32mtext_feature.shape\033[0m ", text_feature.shape)
-
-# Calculate Similarity
-image_feature = image_feature / image_feature.norm(dim=-1, keepdim=True)
-text_feature = text_feature / text_feature.norm(dim=-1, keepdim=True)
-similarity = (math.exp(logit_scale) * image_feature @ text_feature.T).softmax(dim=-1)
-
-for i, (image_path, image) in enumerate(zip(image_path_ls, images)):
-    print(image_path)
-    plt.imshow(image)
-    plt.show()
-    for j in range(len(bert_input)):
-        print(f'{bert_input[j]}: {similarity[i, j].item()}')
-    print('\n')
+if __name__ == '__main__':
+    loguru.logger.debug("Run Main")
+    RunMain()
